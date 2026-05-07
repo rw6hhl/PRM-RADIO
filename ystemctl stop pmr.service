@@ -1,0 +1,14 @@
+○ pmr.service - PMR Radio Gateway
+     Loaded: loaded (]8;;file://orangepione/etc/systemd/system/pmr.service/etc/systemd/system/pmr.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: inactive (dead) since Thu 2026-05-07 06:31:33 UTC; 53ms ago
+   Duration: 3min 18.260s
+    Process: 4314 ExecStart=/root/repa/pmr_start.sh (code=killed, signal=TERM)
+   Main PID: 4314 (code=killed, signal=TERM)
+        CPU: 25.818s
+
+May 07 06:28:14 orangepione systemd[1]: Started pmr.service - PMR Radio Gateway.
+May 07 06:31:33 orangepione systemd[1]: Stopping pmr.service - PMR Radio Gateway...
+May 07 06:31:33 orangepione systemd[1]: [0;1;38;5;185m[0;1;39m[0;1;38;5;185mpmr.service: Failed to kill control group /system.slice/pmr.service, ignoring: Invalid argument[0m
+May 07 06:31:33 orangepione systemd[1]: pmr.service: Deactivated successfully.
+May 07 06:31:33 orangepione systemd[1]: Stopped pmr.service - PMR Radio Gateway.
+May 07 06:31:33 orangepione systemd[1]: pmr.service: Consumed 25.817s CPU time, 1.7M memory peak, 0B memory swap peak.

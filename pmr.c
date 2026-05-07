@@ -1,0 +1,1223 @@
+#include <stdio.h>
+#include <malloc.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/soundcard.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <termios.h>
+#include <signal.h>
+#include <math.h>
+
+// Добавляем библиотеку ALSA, если ее нет на компе устанавливаем командой sudo apt-get install libasound2-dev
+#include <alsa/asoundlib.h>
+#include "g711.c"   // В этом файле уже заполненные массивы для кодека G711
+// unsigned char s711[0x10000]; Тут по 16 битному индексу получаем байт для передачи по каналу
+// short         b711[0x100];   А здесь по байту с канала опять получаем 16 битное число для звука
+#include <wiringPi.h> // GPIO
+// команда gpio readall выводит схему контактов
+
+
+const int buttonPRM = 8; // отслеживаем контакт на замыкание на землю (начинаем передавать звук)
+const int buttonPRD = 12; // включаем передатчик
+int My_Button = 1; // управляем приемом передачей в канал PMR через контакт buttonPRM 0 - выключено, не ноль включено
+
+unsigned short Priznak_pmr = 11001;
+
+
+#define WAV_8000_16    25 // частота дисретизации  8000, звук 16 бит  128 кБит/сек
+#define WAV_16000_16   21 // частота дисретизации 16000, звук 16 бит  256 кБит/сек 
+#define WAV_8000_G711  26 // частота дисретизации  8000, звук 16 бит, используется квантование кодека G711, 64 кБит/сек, для Шарманки применять только этот
+#define WAV_16000_G711 22 // частота дисретизации 16000, звук 16 бит, используется квантование кодека G711, 128 кБит/сек 
+
+int wave_kodek = WAV_16000_G711; // качество передачи звука в канал PMR
+
+
+#pragma pack (1)
+int My_Vox = 0; // если не ноль, то vox включен, положительное число при уровне которого будет включаться передача (уровенть от 1 до 32768)
+int vox_pause = 15; // время через которое vox будет выключен при отсутсвии сигнала (50 - равен одной секунде)
+
+int MyMailIndex  = 903521;
+int MyPChannel   = 5;
+
+
+static char *deviceOut = "plughw:0,0"; // звуковое устройство ALSA, для встроенной зв. карты "plughw:0,0"
+static char *deviceIn  = "plughw:0,0"; // для USB карты, "plughw:0,0" посмотреть можно через команду alsamixer, выбор карты F6, затем F4 выбор микрофона, F3 динамики
+
+char ip_server[54]={"185.221.154.39"};
+
+unsigned short PORT_prm = 52491; // Можно выбрать любой порт для приема
+unsigned short PORT_prd = 16000;// А вот базовый порт сервера строго определен, порт 16000 это порт репитера, вся пришедшая на этот порт
+                                // информация отсылатеся обратно и больше никому не передается, а вот с портов с 16001 по 16255 рассылается всем кто стоит в канале кроме пославшего эту информацию
+                                // для того что бы порт знал кому посылать, клиенты напоминают о себе посылая раз в секунду тестовый сигнал. Если в течении 4-5 секунд от клиента ничего не пришло
+                                // сервер вычеркивает клиента из памяти
+
+#define BUF_FRAMES 320 // Тут число в семплах, то есть при моно и 16 битах это 640 байт
+#define IN_CHANNELS 1  // Сигнал моно для микрофона
+#define OUT_CHANNELS 1 // И моно для выхода звука
+
+int OUT_RATE = 16000; // И для приема и для передачи используем частоту дискретизации 16000, это максимальная частота 8000 герц
+int IN_RATE  = 16000;  // 16000 * 2(16 бит) = 32000 байт в секунду поделим на 640 = 50 пакетов в секунду, то есть каждые 20 миллисекунд будем получать новую порцию звука
+
+int    onUsilMic  = 0;     // 0 - усилитель выключен для микрофонного входа, 1 - усилитель включен
+double MicUsildouble = 2.0;// коэффициент усиления
+double maxMic;
+
+int    onUsilDin  = 0;     // 0 - усилитель выключен для выхода звуковой карты, 1 - усилитель включен
+double DinUsildouble = 0.4;// коэффициент усиления
+double maxDin;
+
+int ciklPause = 0;
+int Ticx100   = 15; // время через которое передатчик будет выключен при отсутсвии сигнала с канала PMR (50 - равен одной секунде)
+int ticPoslePrd = 0;
+int PoslePrd    = 3; // когда передатчик выключится сколько сот секунда нельзя включать VOX
+
+int kanal_PRD; // тут храниться смещение относительно базового порта 16000, то есть при передаче к 16000 приплюсовывается значение kanal_PRD
+
+struct ZAGOLOWOK { // вся информация которая идет через сервер должна иметь размер больше 4 байт, первые четыре байта служебные
+ unsigned char  command; // это поле заполняет клиент, сервер на него реагирует только если сообщение равно размеру 4 байта, если больше - просто пропускает через себя 
+ unsigned char  kanal;   // Это поле заполняет сервер, если порт от 16001 до 16255, то если ведется обмен через порт 16025, то там будет значение = 16025 минус 16000, то есть 25 канал
+ unsigned short client;  // Это поле заполняет сервер, сообщается от какого именно клиента пришло сообщение, значение от нуля и выше, если сервер ушел с канала а потом вернулся, то номер может поменятся
+                 } ;
+
+unsigned short kanal_Secret = 0; // если тут не ноль, то канал считается закрытым, клиент раз в секунду передает серверу это число в поле "client", а сервер будет коммутировать клиенту только 
+                                 // сообщение тех клиентов у кого стоит такое же число
+
+#define BufferLen	4096
+int DOBROT = 64;
+#include "filter.c"
+struct FILTER_ filterPRM;
+
+
+int My_maxMic = 0, MyTestVol = 0;
+int MyTestPrd = 0;
+
+void Delim_ili_Compress(short *prm, int rc, double *maxD)
+{
+ double delit;
+ double r; 
+ int i;
+ int max = 0;
+ for(i = 0; i < rc; i++)
+ {
+  if(max <  abs(prm[i])) max =  abs(prm[i]);
+ }
+ r = 0x7FFF;
+ delit = r / max;
+ if(delit < *maxD) *maxD = delit;
+ if(delit > *maxD) delit = *maxD;
+ for(i = 0; i < rc; i++)
+ {
+  r = prm[i];
+  r = r * delit;
+  prm[i] = (short)r;
+ }
+}
+
+void *Timer(void *pr); // поток таймера, он будет передавать раз в секунду тестовые сообщения
+
+int srv_socket; // значение сокета который будут открыт я решил хранить в глобальной переменной, ниже функци которые обслуживают работу через сеть
+int  prDsocket(int srv_socket,unsigned long ipadres,u_short port,char *buf,int kol);
+int  prMsocket(char *buf,int kol,int srv_socket,unsigned long *ip);
+void closesocket(int srv_socket);
+int  opensocket(u_short port);
+void *prmudp(void *pr);  // поток в котором будет осуществляться прием пакетов UDP
+unsigned long IPservera; // тут хранится IP сервера в виде 32 битного адреса
+
+
+//#define  FALSE 0
+//#define  TRUE  1
+volatile int STOP=FALSE; // во всех потоках выполняется цикл while(!STOP), когда основня программа закрывается то перед этим она присваевает STOP=TRUE и потоки закрываются 
+
+
+struct MYSAVE { // Введем структуру где будем хранить основные настройки PMR, которую будем читать при запуске программы и сохранять при выходе
+int MailIndex;  // Это наш почтовый индекс от 0 до 999999
+int Simplex;    // Если положителен, то во время своей передачи мы не обращаем внимания на свой прием
+int PChannel;   // канал в формате PMR
+} MySave;
+
+
+int P_Prd = 0; // Введем переменную которая будет регулировать передачу в сеть
+int P_Prm = 0; // Будем использовать как счетчик прием, если таймер сбросит его в ноль - приема нет
+int Zumer = 0; // при приеме вызова в потоке приема UDP просто запишем в эту переменную значение 2, что бы остальные действия выполняли в потоке таймера
+
+
+// В этом потоке инициализируется звуковая карта, но нам важна только функция чтения звуковых данных. Для всех сред будет общим то, что читать мы будем
+// 16 битный моно звук по 640 байт, или 320 семплов
+void *GetSound(void *pr)
+{
+ int i;
+ int err,kolpausevox=0;;
+ unsigned int rate = IN_RATE;
+ snd_pcm_t *capture_handle;
+ snd_pcm_hw_params_t *hw_params;
+ snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
+ unsigned short *m16bit;
+ unsigned char  *m;
+
+ struct PRD { // эту структуру после заполнения звуком будем передавать серверу
+       struct ZAGOLOWOK z;
+       char buffer[BUF_FRAMES * 2];
+ } prd;
+
+ // Дальше нстройки нас не сильно должны волновать, в андроид они будут выглядеть по другому, главное что мы долны получить 
+ // моно, 16 бит, с частотой дискретизации 16000 раз в секунду, идем сразу к функции чтения данных
+ if ((err = snd_pcm_open (&capture_handle, deviceIn, SND_PCM_STREAM_CAPTURE, 0)) < 0) 
+ {
+  printf ("IN cannot open audio device %s (%s)\n", deviceIn, snd_strerror (err));
+  return pr;
+ }
+
+// printf("IN audio interface opened\n");
+
+ if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0)
+ {
+  printf ("IN cannot allocate hardware parameter structure (%s)\n",snd_strerror (err));
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params allocated\n");
+
+ if ((err = snd_pcm_hw_params_any (capture_handle, hw_params)) < 0) 
+ {
+  printf ("IN cannot initialize hardware parameter structure (%s)\n", snd_strerror (err));
+
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params initialized\n");
+
+ if ((err = snd_pcm_hw_params_set_access (capture_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) 
+ {
+  printf ("IN cannot set access type (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params access setted\n");
+
+ if ((err = snd_pcm_hw_params_set_format (capture_handle, hw_params, format)) < 0) 
+ {
+  printf ("IN cannot set sample format (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params format setted\n");
+
+ if ((err = snd_pcm_hw_params_set_rate_near (capture_handle, hw_params, &rate, 0)) < 0) 
+ {
+  printf ("IN cannot set sample rate (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params rate setted\n");
+
+ if ((err = snd_pcm_hw_params_set_channels (capture_handle, hw_params, IN_CHANNELS)) < 0) 
+ {
+  printf ("IN cannot set channel count (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params channels setted\n");
+
+ if (snd_pcm_hw_params_set_buffer_size(capture_handle, hw_params, BUF_FRAMES * 2) < 0) 
+// if (snd_pcm_hw_params_set_buffer_size(capture_handle, hw_params, BUF_FRAMES * 4) < 0) 
+ {
+  printf("IN Error setting buffersize.\n");
+  printf ("IN cannot set channel count (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+// printf("IN Setting buffersize.\n");
+
+
+ if ((err = snd_pcm_hw_params (capture_handle, hw_params)) < 0) 
+ {
+  printf ("IN cannot set parameters (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN hw_params freed\n");
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN hw_params setted\n");
+
+ snd_pcm_hw_params_free (hw_params);
+
+// printf("IN hw_params freed\n");
+
+ if ((err = snd_pcm_prepare (capture_handle)) < 0) 
+ {
+  printf ("IN cannot prepare audio interface for use (%s)\n", snd_strerror (err));
+  snd_pcm_close (capture_handle);
+  printf("IN audio interface closed\n");
+  return pr;
+ }
+
+// printf("IN audio interface prepared\n");
+ printf("START IN  %s  %d  %d\n",deviceIn,IN_RATE,IN_CHANNELS);
+
+ m16bit = (unsigned short *)prd.buffer;
+ m      = (unsigned char  *)prd.buffer;
+// uk = (short *)prd.buffer;
+
+
+ // вот цикл при котором будем читать звук, так как в настройка мы указали способ - ждать пока заролняться данные, значит функци нам отдаст
+ // упрвление только после того как данные будут записаны в наш буфер количеством BUF_FRAMES 16 разрядных слов или 640 байт
+ while(!STOP) 
+ {
+  if ((err = snd_pcm_readi (capture_handle, prd.buffer, BUF_FRAMES)) < 0) // 
+  {
+   snd_pcm_prepare (capture_handle);
+   printf("IN ============ FULL BUFFER >>>>>>>>>>>>>>> \n");
+  }
+  else // записано удачно
+  {
+   if(MyTestVol && My_Vox == 0) // если включен тест - измеряем уровень по микрофону
+   {
+    int amp, max = 0;
+    short *uk = (short *)prd.buffer;
+    for(i = 0; i < BUF_FRAMES; i++)
+    {
+     amp = abs(uk[i]);
+     if(amp > max) max = amp;
+    }
+    My_maxMic = max;
+   }
+
+   if(My_Vox)
+   {
+    int amp,max = 0;
+    short *uk = (short *)prd.buffer;
+    for(i = 0; i < BUF_FRAMES; i++)
+    {
+     amp = abs(uk[i]);
+     if(amp > max) max = amp;
+    }
+    My_maxMic = max;
+   //printf(" = %d\n",max);
+    if(max < My_Vox)
+    {
+     if(P_Prd)
+     {
+      kolpausevox++;
+      //printf("kolpausevox = %d\n",kolpausevox);
+      if(kolpausevox > vox_pause)
+      {
+       P_Prd = 0;
+       kolpausevox = 0;
+       if(MyTestPrd) printf("1-PRM\n");
+      }
+     }
+    }
+    else
+    {
+     if(P_Prd == 0 && P_Prm == 0 && ticPoslePrd == 0) 
+     {
+      P_Prd = 1;
+      kolpausevox=0;
+      if(MyTestPrd) printf("2-PRD  %d  %d\n",max, My_Vox);
+     }
+    }
+    //printf(" = %d   %d\n",max,P_Prd);
+   }
+   if(My_Button)
+   {
+    if(read_gpio13() == 1) // HIGH = передача
+    {
+     P_Prd = 1;
+     if(MyTestPrd) printf("3-PRD\n");
+    }
+    else
+    {
+     P_Prd = 0;
+     if(MyTestPrd) printf("4-PRM\n");
+    }
+
+   }
+   // 16000 8 G711
+// printf("err = %d\n",err);
+   if(P_Prd && P_Prm == 0) // если передача в сеть разрешена
+   {
+    if(onUsilMic) // если включен усилитель по микрофону
+    {
+     if(MicUsildouble > 0.0 && maxMic < MicUsildouble) maxMic = maxMic + 0.1;
+     if(maxMic > MicUsildouble) maxMic = MicUsildouble;
+     Delim_ili_Compress((short *)prd.buffer,BUF_FRAMES,&maxMic);
+    }
+
+    switch (wave_kodek)
+    {
+     case WAV_16000_G711:
+
+      for(i = 0; i < 320; i++)
+      {
+       m[i] = s711[m16bit[i]];
+      }
+      //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+      prd.z.command = WAV_16000_G711;// Это признак именно этого кодека
+      prd.z.kanal = 0;   //
+      prd.z.client = Priznak_pmr;
+      prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&prd,4+BUF_FRAMES);// передаем 320 байт G911 + 4 байта заголовка
+     break;
+
+
+     case WAV_16000_16:
+      prd.z.command = WAV_16000_16;// Это признак именно этого кодека
+      prd.z.kanal = 0;   //
+      prd.z.client = Priznak_pmr;
+      prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&prd,4+(BUF_FRAMES*2));// передаем 320 байт G911 + 4 байта заголовка
+     break;
+
+     case WAV_8000_G711:
+     {
+      int res,R,n;
+      float re,out;
+      static float umnov = 0x7FFF;
+      float d = 0x7FFF;
+      
+      for(i = 0, n = 0; i < 320; i++)
+      {
+       re = (float)(short)(m16bit[i]);
+       re = re / d; 
+       res = filter_run(&filter_16000_4, re, &out);
+       if(res)
+       {
+        R = (int)(out * umnov);
+        while(abs(R) >= 0x7FFF) 
+	{
+         umnov = umnov - 1;
+         R = (int)(out * umnov);
+	}
+        m16bit[n]   = (short)R;
+        n = n + 1;
+       }
+      }
+      for(i = 0; i < 160; i++)
+      {
+       m[i] = s711[m16bit[i]];
+      }
+      prd.z.command = WAV_8000_G711;
+      prd.z.kanal = 0;   //
+      prd.z.client = Priznak_pmr;
+      prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&prd,4+(BUF_FRAMES / 2));// передаем 160 байт G911 + 4 байта заголовка
+     }
+     break;
+
+     case WAV_8000_16:
+     {
+      int res,R,n;
+      //short *prm = (short *)Bufer;
+      float re,out;
+      static float umnov = 0x7FFF;
+      float d = 0x7FFF;
+      for(i = 0, n = 0; i < 320; i++)
+      {
+       if(IN_CHANNELS == 1) re = (float)(short)(m16bit[i]);
+       else                 re = (float)(short)(m16bit[i*2]);
+       re = re / d; 
+       res = filter_run(&filter_16000_4, re, &out);
+       if(res)
+       {
+        R = (int)(out * umnov);
+        while(abs(R) > 0x7FFF) 
+	{
+         umnov = umnov - 1;
+         R = (int)(out * umnov);
+	}
+        m16bit[n]   = (short)R;
+        n = n + 1;
+       }
+      }
+      prd.z.command = WAV_8000_16;
+      prd.z.kanal = 0;   //
+      prd.z.client = Priznak_pmr;
+      prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&prd,4+BUF_FRAMES);// передаем 320 байт G911 + 4 байта заголовка
+     }
+     break;
+    }
+
+   }// так как при передаче по UDP мы передаем данные в буфер, то "лепить" свои кольцевые буферы нам не нужно, все уже сделано
+  } // таким образом передача звука очень проста, кстати можно передать чистый 16 битный звук, виндусовая PMR его поймет, можно не делать преобразование в G711
+ }  // заполнить prd.z.command = 21; а количество указать 4+(BUF_FRAMES *2), но битрейт увеличится до 256 Кбит/сек, но повышения качества мало кто заметит
+
+ // закрываем звуковое устройство по микрофону
+ snd_pcm_close (capture_handle); // закрытие звука ALSA, в андроид свои такие штучки
+ printf("IN audio interface closed\n");
+
+
+ return pr;
+}
+
+#define KOLSTRUCT_MAX_WAVE_OUT 100 // количество звука на 2 секунды, все кольцо
+
+int KtoActual = -1; // Храним номер клиента, который сейчас озвучивается
+char cBufer[KOLSTRUCT_MAX_WAVE_OUT][BUF_FRAMES * 2]; // кольцевой буфер
+int  I_buf_save = 0; // указатели записи и чтения которые ослуживают этот буфер
+int  I_buf_load = 0;
+
+int GetKolPack(void) // узнаеm сколько пакетов в очереди воспроизведения кольцевого буфера (разница между указателями записи и чтения)
+{
+ int s,l,kol = 0;
+ s = I_buf_save;
+ l = I_buf_load;
+
+ while(s != l)
+ {
+  if(l < KOLSTRUCT_MAX_WAVE_OUT - 1) l = l + 1;
+  else                               l = 0;
+  kol++;
+ }
+ return kol;
+}
+
+void *SetSound(void *pr) // поток воспроизведения звука
+{
+ int  Uprevdenie = 1; // после скольки принятых пакетов начинать воспроизведение, на еденицу больше этого значения, то есть при принятых двух пакетах
+ int  tic = 0; // счетчик отсутсвия данных для воспроизведения
+ int err;
+ unsigned int i;
+ snd_pcm_sframes_t frames;
+ snd_pcm_hw_params_t *hw_params;
+ snd_pcm_t *playback_handle;
+ snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
+
+ int   Start = 0;
+ char Bufer[BUF_FRAMES*2];
+ int cikl = 0;
+ // тут не стоит обращать внимание на инициализацию, в разных библиотеках она разная
+ if ((err = snd_pcm_open(&playback_handle, deviceOut, SND_PCM_STREAM_PLAYBACK, 0)) < 0) 
+ {
+  printf("OUT Playback open error: %s\n", snd_strerror(err));
+  return pr;
+ }
+
+ if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0)
+ {
+  printf ("OUT cannot allocate hardware parameter structure (%s)\n",snd_strerror (err));
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT hw_params allocated\n");
+
+ if ((err = snd_pcm_hw_params_any (playback_handle, hw_params)) < 0) 
+ {
+  printf ("OUT cannot initialize hardware parameter structure (%s)\n", snd_strerror (err));
+
+  snd_pcm_hw_params_free (hw_params);
+  printf("OUT hw_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT hw_params initialized\n");
+
+ if ((err = snd_pcm_hw_params_set_access (playback_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) 
+ {
+  printf ("OUT cannot set access type (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("OUT hw_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT hw_params access setted\n");
+
+ if ((err = snd_pcm_hw_params_set_format (playback_handle, hw_params, format)) < 0) 
+ {
+  printf ("OUT cannot set sample format (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("IN OUT_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT hw_params format setted\n");
+
+ if ((err = snd_pcm_hw_params_set_rate_near (playback_handle, hw_params, &OUT_RATE, 0)) < 0) 
+ {
+  printf ("OUT cannot set sample rate (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("OUT hw_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+ if ((err = snd_pcm_hw_params_set_channels (playback_handle, hw_params, OUT_CHANNELS)) < 0) 
+ {
+  printf ("OUT cannot set channel count (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("OUT hw_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT hw_params channels setted\n");
+
+// if (snd_pcm_hw_params_set_buffer_size(playback_handle, hw_params, BUF_FRAMES * 2) < 0) 
+ if (snd_pcm_hw_params_set_buffer_size(playback_handle, hw_params, BUF_FRAMES * 4) < 0) 
+ {
+  printf("OUT Error setting buffersize.\n");
+  printf ("OUT cannot set channel count (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("OUT hw_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+// printf("OUT Setting buffersize.\n");
+
+
+ if ((err = snd_pcm_hw_params (playback_handle, hw_params)) < 0) 
+ {
+  printf ("OUT cannot set parameters (%s)\n", snd_strerror (err));
+  snd_pcm_hw_params_free (hw_params);
+  printf("OUT hw_params freed\n");
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT hw_params setted\n");
+
+ snd_pcm_hw_params_free (hw_params);
+
+// printf("OUT hw_params freed\n");
+
+ if ((err = snd_pcm_prepare (playback_handle)) < 0) 
+ {
+  printf ("OUT cannot prepare audio interface for use (%s)\n", snd_strerror (err));
+  snd_pcm_close (playback_handle);
+  printf("OUT audio interface closed\n");
+  return pr;
+ }
+
+// printf("OUT audio interface prepared\n");
+ printf("START OUT %s  %d  %d\n",deviceOut,OUT_RATE,OUT_CHANNELS);
+
+//*/
+
+
+ // переходим сразу к циклу потока
+ while(!STOP) 
+ {
+  int kol = GetKolPack(); // узнаем у буфера сколько пакетов в очереди
+
+  if(Start)// если установлен маркер воспроизведения
+  { 
+   if(kol == 0) // а данных для воспроизведения больше нет
+   {
+    Start = 0; // отключаем признак воспроизведения
+   }
+  }
+  else // если до этого признака воспроизведения не было
+  {
+   if(kol > Uprevdenie) // но в очереди пакетов уже больше чем нужно для старта
+   {
+    Start = 1; // значит старт для воспроизведения
+   }
+  }
+
+  if(Start) // есть данные для воспроизведения
+  {
+   ciklPause = 1;
+   if(I_buf_save != I_buf_load) // указетели записи и чтения не равны, на всякий случай еще раз проверяем, если kol дал неверное количество
+   {
+    memcpy(Bufer,cBufer[I_buf_load],BUF_FRAMES*2); // считываем данные для воспроизведения
+    static int sil = 0; sil = 0; ptt_on();
+    if(onUsilDin) // если включен усилитель
+    {
+     if(DinUsildouble > 0.0 && maxDin < DinUsildouble) maxDin = maxDin + 0.1;
+     if(maxDin > DinUsildouble) maxDin = DinUsildouble;
+     Delim_ili_Compress((short *)Bufer,BUF_FRAMES,&maxDin);
+    }
+
+    tic = 0;// сбрасывае счетчик, что говорит о том, что воспроизведение в работе 
+    if(I_buf_load < KOLSTRUCT_MAX_WAVE_OUT - 1) I_buf_load = I_buf_load + 1;// наращиваем указатель чтения
+    else                                        I_buf_load = 0;
+   }
+  } // закончено формирование конечного буфера для передачи звуковой карте
+  else // нет ничего для воспроизведения
+  {
+   memset(Bufer,0,BUF_FRAMES*2); // отправляем на воспроизведение чистый буфер
+    static int sil = 0;
+    sil++;
+    if(sil > 50) { ptt_off(); sil = 0; }
+   if(ciklPause)
+   {
+    ciklPause++;
+    if(ciklPause > Ticx100)
+    {
+     ciklPause = 0;
+    }
+   }
+  }
+
+  cikl++; 
+  if(cikl > 10) // одна секунда это 50 тиков, значит каждые 200 милисекунд 
+  {
+   tic++; // наращиваем таймер
+   if(tic > 10) // и если уже более секунды нет информации
+   {
+    KtoActual = -1; // забываем клиента, который до этого озвучивался
+   }
+   cikl = 0; // сбрасываем счетчик которые режет по 200 миллисекунд
+  }
+
+
+  //  осталось воспроизвести
+  if(Start == 0) frames = snd_pcm_writei(playback_handle, Bufer, BUF_FRAMES / 8); // если звук пустой, то делаем воспроизведение короче, что бы звуковое устройство раньше освободилось
+  else           frames = snd_pcm_writei(playback_handle, Bufer, BUF_FRAMES);     // и мы бы оперативнее смогли выдать новый звук, если появятся данные для воспроизведения 
+  if (frames < 0) frames = snd_pcm_recover(playback_handle, frames, 0);
+  if (frames < 0)
+  {
+   printf("OUT snd_pcm_writei failed: %s\n", snd_strerror(frames));
+   break;
+  }
+ }
+ // закрытие основного цикла потока, а дальше закрытие звукового устройства
+ snd_pcm_close(playback_handle);
+ printf("OUT Playback interface closed\n");
+
+ return pr;
+}
+
+
+
+
+void ptt_on()  { system("echo 1 > /sys/class/gpio/gpio21/value 2>/dev/null"); }
+void ptt_off() { system("echo 0 > /sys/class/gpio/gpio21/value 2>/dev/null"); }
+int read_gpio13() {
+    FILE *f = fopen("/sys/class/gpio/gpio13/value", "r");
+    int v = 0;
+    if(f) { fscanf(f, "%d", &v); fclose(f); }
+    return v;
+}
+int main (int argc, char *argv[])
+{
+ char str[256], *p;
+ pthread_t tidudp;     // нужны для запуска потоков
+ pthread_t tidTimer;   //
+ pthread_t tidGetSound;//
+ pthread_t tidSetSound;//
+ pthread_attr_t attr;  //
+ int patt,i,n;             // 
+ FILE *file;
+
+
+
+ memset(filter_16000_4.filter,0,BufferLen * sizeof(float));
+ memset(filter_16000_4.buffer,0,BufferLen * sizeof(float));
+ for(i = 0; i < DOBROT; i++) filter_16000_4.filter[i] = coef_fil_16000_4[i];
+
+ filterPRM.length = DOBROT;
+ filterPRM.decimateratio = 1;
+ filterPRM.pointer = DOBROT;
+ filterPRM.counter = 0;
+ memset(filterPRM.filter,0,BufferLen * sizeof(float));
+ memset(filterPRM.buffer,0,BufferLen * sizeof(float));
+ for(i = 0; i < DOBROT; i++) filterPRM.filter[i] = coef_fil_16000_4_1[i];
+
+
+ IPservera = inet_addr(ip_server); // ну тут все понятно, раз программа на Си, а не С++ то присвоение должно быть в теле функции
+
+ MySave.MailIndex = MyMailIndex;// как уже писал эксперименты мы проводим при почтовом индексе 1
+ MySave.PChannel  = MyPChannel; // прошлый раз использовали 1 канал, сегодня будем второй юзать
+
+
+ wiringPiSetup();
+    system("echo 13 > /sys/class/gpio/export 2>/dev/null");
+    system("echo in > /sys/class/gpio/gpio13/direction 2>/dev/null");
+    system("echo 21 > /sys/class/gpio/export 2>/dev/null");
+    system("echo out > /sys/class/gpio/gpio21/direction 2>/dev/null");
+ pinMode(buttonPRM, INPUT);
+ pinMode(buttonPRD, OUTPUT);
+
+
+ // Преобразуем настройки из формата PMR в формат сервера
+ if(MySave.PChannel == 0) kanal_PRD = 0;
+ else                     kanal_PRD = ((MySave.MailIndex & 0xF) * 8) + MySave.PChannel;// то есть получится канал 10
+ kanal_Secret = (MySave.MailIndex & 0xFFFFFFF0) >> 4;         // секретное число 0
+ printf("MailIndex = %d PChannel = %d   kanal_PRD = %d kanal_Secret = %d\n",MySave.MailIndex, MySave.PChannel, kanal_PRD, kanal_Secret);
+
+
+ patt=pthread_attr_init(&attr);                              // в данной программе этого можно было не делать, но я взял за правило давать 
+ pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED); // такой параметр потока, что бы их можно было запускать многократно
+
+ srv_socket=opensocket(PORT_prm); // вначале инициализируем сокет
+
+ // а затем запускаем потоки
+ pthread_create(&tidudp,NULL,prmudp,(void *)&srv_socket); // прием UDP
+ pthread_create(&tidTimer,NULL,Timer,(void *)&srv_socket);// наш таймер
+ pthread_create(&tidGetSound,&attr,GetSound,NULL);        // Вход звука
+ pthread_create(&tidSetSound,&attr,SetSound,NULL);        // Выход звука
+
+ while(!STOP) // сделал пользовательский интерфейс как можно проще
+ {
+  memset(str,0,sizeof(str));
+  p = str;
+  while(!STOP) { sleep(1); }
+  for(i = 0; i < strlen(str); i++) if(str[i] == '\n') str[i] = 0;
+  if(!strcmp(str,"exit") || !strcmp(str,"EXIT")) break; // если введена команда закрытия, выходим из цикла
+  if(str[0] == 0) // нажата клавиша Enter, она управляет приемом / передачей
+  {
+   if(P_Prd)      // в принципе тут все понятно
+   {
+    P_Prd = 0;
+    printf("PRM\n");
+   }
+   else
+   {
+    P_Prd = 1;
+    printf("PRD\n");
+   }
+  }
+  if(str[1] == 0) // введен один символ
+  {
+   switch (str[0])
+   {
+    case 'b': // вызов, то есть звонок
+     if(MySave.PChannel != 0) 
+     {
+      struct BELL {
+      struct ZAGOLOWOK z;
+       char s[20];
+       } b;
+      b.z.command = 20;   // отправляе серверу сообщение о звонке
+      sprintf(b.s,"BELL");
+      prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&b,4+20);
+   
+      Zumer = 2;
+     }
+    break;
+
+    case 't': // 
+     if(MyTestVol) MyTestVol = 0;
+     else          MyTestVol = 1;
+    break;
+
+    case 'p': // 
+     if(MyTestPrd) MyTestPrd = 0;
+     else          MyTestPrd = 1;
+     printf("MyTestPrd = %d\n",MyTestPrd);
+    break;
+
+    case '0':  //  введен новый канал
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+    case '5':
+    case '6':
+    case '7':
+    case '8':
+    case '9':
+     if(P_Prd == 0)
+     {
+      struct ZAGOLOWOK z;
+      if(MySave.PChannel != 0) // если старый канал был не репитерный, то посылаем серверу сообщение об уходе с этого кнала, иначе он его осводит через 4-5 секунд
+      {                        // пака не освободиться старый канал, новый зарегестрировать сервер не даст
+       z.command = 1;
+       prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&z,4);
+      }
+      MySave.PChannel = str[0] - 48; // устанавливаем новый канал
+      // Преобразуем настройки из формата PMR в формат сервера
+      if(MySave.PChannel == 0) kanal_PRD = 0; // репитерный канал, для проверки на себя
+      else                     kanal_PRD = ((MySave.MailIndex & 0xF) * 8) + MySave.PChannel;// то есть получится канал 10
+      kanal_Secret = (MySave.MailIndex & 0xFFFFFFF0) >> 4;         // секретное число 0
+      printf("MailIndex = %d PChannel = %d   kanal_PRD = %d kanal_Secret = %d\n",MySave.MailIndex, MySave.PChannel, kanal_PRD, kanal_Secret);
+      if(MySave.PChannel != 0) // если новый канал не репитерный
+      {
+       if(kanal_Secret)        // если канал закрыт секретным кодом, передаем серверу секретный код и регистрируемся в канале
+       {
+        z.command = 7;
+        z.kanal   = 0;
+        z.client  = kanal_Secret;
+       }
+       else z.command = 0;    // канал не закрыт секретным кодом, регистрируемся как обычно
+       prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&z,4); // непосредственно сама передача на сервер
+      }
+     } 
+    break;
+   }
+  }
+
+ }
+
+ STOP=TRUE; // разрываем циклы
+ closesocket(srv_socket); // закрываем сокет
+
+ sleep(1); // на всякий случай подождем секунду, что бы потоки сами закрылись
+ return 0;
+}
+
+// а вот наш таймер
+void *Timer(void *pr)
+{
+ int cikl_PRD = 0;
+ struct ZAGOLOWOK z; // это будет служебный заголовок
+
+ int sock;                     // можно было бы использовать глобальное значение сокета, но в данной программе
+ memcpy(&sock,pr,sizeof(int)); // я его передал потоку через параметр
+
+ int MAX = 0, MIN = 0xFFFF, PRD = 0;
+ int Old_cikl_out_wave = 0;
+
+ while(!STOP) // 10 раз в секунду срабатыает этот цикл
+ {
+
+  cikl_PRD++;
+  if(cikl_PRD > 9) // раз в секунду посылается тест
+  {
+   if(kanal_Secret) // если у нас есть секретный код, то посылаем такую последовательность
+   {
+    z.command = 7;
+    z.kanal   = 0;
+    z.client  = kanal_Secret;
+   }
+   else z.command = 0; // или просто в первом байте шлем ноль
+
+   if(MySave.PChannel != 0) // если канал не тестовый, то передаем 
+   {
+    prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&z,4);
+   }
+   cikl_PRD = 0;
+  }
+
+  if(PRD != P_Prd)
+  {
+   PRD = P_Prd;
+   if(PRD == 0)
+   {
+    MAX = 0;
+    MIN = 0xFFFF;
+   }
+  }
+  if(MyTestVol)
+  {
+   if(MAX < My_maxMic) MAX = My_maxMic;
+   if(MIN > My_maxMic) MIN = My_maxMic;
+   printf("prd = %d  max = %d  min = %d  vol =  %d\n",P_Prd,MAX,MIN,My_maxMic);
+  }
+
+  if(ticPoslePrd > 0)
+  {
+   ticPoslePrd--;
+  }
+
+  if(Old_cikl_out_wave != ciklPause)
+  {
+   if(ciklPause == 0)
+   {
+    ticPoslePrd = PoslePrd;
+    P_Prm = 0;
+    digitalWrite(buttonPRD,LOW);
+   }
+   else
+   {
+   }
+   Old_cikl_out_wave = ciklPause;
+  }
+
+
+//  // следим за приемом, если счетчик вырос, 
+//  if(P_Prm) P_Prm++;
+//  if(P_Prm > 4) // больше 100 миллисекунд, значит ничего не приходило на прием
+//  {
+//   P_Prm = 0; // значит приема уже нет
+//   digitalWrite(buttonPRD,LOW);
+//   //InvalidateRect(Glhwnd,NULL,0);
+//  }
+
+
+  usleep(100000); 
+ }
+
+ return pr;
+}
+
+
+int OutWave(int n, char *Bufer,int KOLZWUKBUF)
+{
+ if(KtoActual == -1) // если кольцевой буфер свободен запоминаем 
+ {
+  KtoActual = n; // нового клиента
+ }
+ else // если буфер не свободен
+ {
+  if(KtoActual != n) return 0; // проверяем тот ли клиент, если нет выходим
+ }
+
+ // записываем звук в кольцевой поток
+ memcpy(cBufer[I_buf_save],Bufer,KOLZWUKBUF);
+ if(I_buf_save < KOLSTRUCT_MAX_WAVE_OUT - 1) I_buf_save++; // наращиваем счетчик записи
+ else                                        I_buf_save = 0;
+
+ return KOLZWUKBUF;
+}
+
+
+
+void *prmudp(void *pr) // поток приема UDP пакетов
+{
+ int sock;
+ int i,n;
+ unsigned long ip; // сюда записывается IP того кто прислал пакет, но в нашем случае это всегда сервер, за исключением сетевых диспетчеров
+ unsigned short m16bit[320]; // сюда будем переводить из G711 в обычный 16 битный звук
+
+ struct PRM { // прием будем осуществлять в эту структуру
+       struct ZAGOLOWOK z;
+       char buffer[BUF_FRAMES * 2];
+ } prm;
+
+ memcpy(&sock,pr,sizeof(int)); // опять примем сокет через параметр
+ 
+ while(!STOP) // на бескончный цикл
+ {
+  memset(&prm,0,sizeof(prm)); // каждый раз перед приемом обнуляем, что бы там не осталась инфлрмациия от старого пакета
+  n = prMsocket((char *)&prm,(int)sizeof(prm),sock,&ip);
+
+//printf("n = %d   %d   %d   %d\n",n,prm.z.kanal,kanal_PRD,MySave.PChannel);
+  // обрабатываем только в том случае, если принято не ноль байт, и если поле канала сервер заполнил таким же значением какое выставлено у нас
+  if(n && (prm.z.kanal == kanal_PRD || kanal_PRD == 0))
+  {
+
+   if(n == 4) // обработка только команд для сервера
+   {
+    switch (prm.z.command)
+    {
+     case 0:
+       if(kanal_Secret) // если сервер прислал нам ответ на тест как с канала не закрытого, то повторяем ему тестовый пакет что мы раьотаем по закрытому каналу
+       {
+        prm.z.command = 7;
+        prm.z.kanal   = 0;
+        prm.z.client  = kanal_Secret;
+        prDsocket(srv_socket,IPservera,PORT_prd+kanal_PRD,(char *)&prm,4);
+       }
+      //printf("Test\n");
+     break;
+
+     case 7:
+      //printf("Secret test\n");
+     break;
+    }
+   }
+   else // это уже не служебная информация, тут может быть все что угодно, но программа PMR обрабатывает только эти сообщения
+   {
+    switch (prm.z.command)
+    {
+
+     case 19:// Даже можно получать 8 битный звук без всяких кодеков
+      if(n != 324) break;
+      if(P_Prm == 0) digitalWrite(buttonPRD,HIGH);
+      //P_Prm = 1;
+      for(i = 0; i < BUF_FRAMES; i++) 
+      {
+       m16bit[i] = prm.buffer[i];
+       m16bit[i] = m16bit[i] * 256; // только надо его привести к 16 битному звуку
+      }
+      OutWave(prm.z.client, (char *)m16bit,BUF_FRAMES*2); ptt_on();
+     break;
+
+     case 20:
+      if(n == 24 && !strcmp(prm.buffer,"BELL")) Zumer = 1;
+      //digitalWrite(buttonPRD,HIGH);
+      //P_Prm = 1;
+     break;
+
+     case 21:
+      if(n != 644) break;
+      if(P_Prm == 0) digitalWrite(buttonPRD,HIGH);
+      //P_Prm = 1;
+      OutWave(prm.z.client, prm.buffer,BUF_FRAMES*2); ptt_on();
+     break;
+
+     case 22:
+      if(n != 324) break;
+      if(P_Prm == 0) digitalWrite(buttonPRD,HIGH);
+      //P_Prm = 1; // сбрасываем счетчик приема
+      for(i = 0; i < BUF_FRAMES; i++)
+      {
+       m16bit[i] = b711[(unsigned char)prm.buffer[i]];
+      }
+      OutWave(prm.z.client, (char *)m16bit,BUF_FRAMES*2); ptt_on();
+     break;
+
+     case 25: // 8000  16 bit
+      if(n != 324) break;
+      if(P_Prm == 0) digitalWrite(buttonPRD,HIGH);
+      //P_Prm = 1;
+      {
+       short b[320];
+       int R;
+       short *prmm;
+       float in,out;
+       static float umnov = 0x7FFF;
+       float d = 0x7FFF;
+       prmm = (short *)prm.buffer;
+       for(i = 0,n = 0; i < 160; i++,n = n + 2)
+       {
+        b[n]   = prmm[i];
+        b[n+1] = prmm[i];
+       }
+       for(i = 0; i < 320; i++)
+       {
+        in = b[i];
+        in = in / d;
+        filter_run(&filterPRM, in, &out);
+        R = (int)(out * umnov);
+        while(abs(R) > 0x7FFF)
+        {
+         umnov = umnov - 1;
+         R = (int)(out * umnov);
+        }
+        b[i]   = (short)R;
+       }
+       OutWave(prm.z.client,(char *)b,BUF_FRAMES*2); ptt_on();
+      }
+     break;
+
+
+
+     case 26: // 8000  G711
+      if(n != 164) break;
+      if(P_Prm == 0) digitalWrite(buttonPRD,HIGH);
+      //P_Prm = 1;
+      {
+       short b[320];
+       int R;
+       short *prmm;
+       float in,out;
+       static float umnov = 0x7FFF;
+       float d = 0x7FFF;
+       for(i = 0; i < 160; i++)
+       {
+        m16bit[i] = b711[(unsigned char)prm.buffer[i]];
+       }
+       prmm = (short *)m16bit;
+       for(i = 0,n = 0; i < 160; i++,n = n + 2)
+       {
+        b[n]   = prmm[i];
+        b[n+1] = prmm[i];
+       }
+       for(i = 0; i < 320; i++)
+       {
+        in = b[i];
+        in = in / d;
+        filter_run(&filterPRM, in, &out);
+        R = (int)(out * umnov);
+        while(abs(R) > 0x7FFF)
+        {
+         umnov = umnov - 1;
+         R = (int)(out * umnov);
+        }
+        b[i]   = (short)R;
+       }
+//printf("prm\n");
+       OutWave(prm.z.client,(char *)b,BUF_FRAMES*2); ptt_on();
+      }
+     break;
+    }
+   }
+  }
+ }
+
+ return pr;
+}
+
+
+
+
+int opensocket(u_short port)
+{
+ int       srv_socket;
+ struct sockaddr_in srv_address;
+ 
+ srv_socket = socket(AF_INET,SOCK_DGRAM,0);
+ if(srv_socket == -1) 
+ {
+  return -1;
+ }
+  
+ srv_address.sin_family = AF_INET;
+ srv_address.sin_addr.s_addr = INADDR_ANY;
+ srv_address.sin_port = htons(port);
+ if(bind(srv_socket,(const struct sockaddr *)&srv_address,sizeof(srv_address)) == -1)
+ {
+  close(srv_socket);
+  return -1;
+ }
+ return srv_socket;
+}
+
+
+void closesocket(int srv_socket)
+{
+ close(srv_socket);
+}
+
+
+
+int prMsocket(char *buf,int kol,int srv_socket,unsigned long *ip)
+{
+ int rc;
+ struct sockaddr_in srv_prm;
+ int nAddrSize;
+
+ nAddrSize=sizeof(srv_prm);
+
+ rc = recvfrom(srv_socket,buf,kol,0,(struct sockaddr *)&srv_prm,(socklen_t *)&nAddrSize);
+ if(!rc || rc == -1) return 0;
+ 
+ *ip=srv_prm.sin_addr.s_addr; 
+ return rc;         
+}
+
+
+
+
+int prDsocket(int srv_socket,unsigned long ipadres,u_short port,char *buf,int kol)
+{
+ struct sockaddr_in srv_address;
+ srv_address.sin_family = AF_INET;
+ srv_address.sin_addr.s_addr = ipadres;//inet_addr(IPser)
+ srv_address.sin_port = htons(port);
+ return sendto(srv_socket,buf,kol,0,(const struct sockaddr *)&srv_address,sizeof(srv_address));
+}
+
