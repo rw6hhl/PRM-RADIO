@@ -7,7 +7,7 @@
 ОС	           Armbian Linux 6.12.74-current-sunxi
 Ядро	           6.12.74-sunxi
 Логин	           root
-Пароль	           kt315kt361
+Пароль	           
 
 Архив repa.zip содержит:
 
